@@ -170,7 +170,7 @@ def infer_level(message: str, source_name: str | None) -> str:
 def infer_event_type(message: str) -> str:
     lowered = message.lower()
     if parse_request_message(message):
-        return "request"
+        return "http_request"
     if "database connection successful" in lowered:
         return "system"
     if "server running" in lowered or "pm2" in lowered:

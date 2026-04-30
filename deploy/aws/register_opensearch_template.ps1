@@ -10,7 +10,7 @@ if (-not $OpenSearchEndpoint) {
   throw "OpenSearchEndpoint is required."
 }
 
-$Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+$Root = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path))
 $TemplatePath = Join-Path $Root "opensearch\index-template.json"
 $Body = Get-Content $TemplatePath -Raw -Encoding UTF8
 

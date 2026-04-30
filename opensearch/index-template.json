@@ -15,7 +15,12 @@
         "instance_id": { "type": "keyword" },
         "instance_name": { "type": "keyword" },
         "event_type": { "type": "keyword" },
-        "message": { "type": "text" },
+        "message": {
+          "type": "text",
+          "fields": {
+            "keyword": { "type": "keyword", "ignore_above": 512 }
+          }
+        },
         "request_id": { "type": "keyword" },
         "user_id": { "type": "keyword" },
         "match_id": { "type": "keyword" },
@@ -25,7 +30,12 @@
         "latency_ms": { "type": "float" },
         "client_ip": { "type": "ip" },
         "error_name": { "type": "keyword" },
-        "error_message": { "type": "text" },
+        "error_message": {
+          "type": "text",
+          "fields": {
+            "keyword": { "type": "keyword", "ignore_above": 512 }
+          }
+        },
         "error_code": { "type": "keyword" },
         "severity": { "type": "keyword" },
         "meta": { "type": "object", "enabled": true },

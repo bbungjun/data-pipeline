@@ -1,0 +1,26 @@
+.state/
+logs/
+*.log
+
+# Local runtime configuration can contain DB, OpenSearch, and Discord secrets.
+config/pipeline.env
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Generated artifacts.
+build/
+__pycache__/
+*.pyc
+node_modules/
+
+# Terraform local state and secret variable files.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+tfplan
+*.tfplan
+terraform.rc
