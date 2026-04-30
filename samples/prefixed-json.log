@@ -1,0 +1,2 @@
+﻿2026-04-30T03:43:00: {"timestamp":"2026-04-30T03:43:00.477Z","level":"info","type":"http_request","method":"GET","url":"/api/replays/MTQxMjQ1Nzk0MDk3NTIyNjk1Mg==","statusCode":304,"statusGroup":"3xx","responseTimeMs":39.189,"contentLength":0,"userAgent":"Mozilla/5.0","ip":"10.121.16.43"}
+2026-04-30T03:46:38: {"timestamp":"2026-04-30T03:46:38.825Z","level":"info","type":"http_request","method":"OPTIONS","url":"/api/auth/gmokGuilds","statusCode":204,"statusGroup":"2xx","responseTimeMs":0.492,"contentLength":0,"userAgent":"Mozilla/5.0","ip":"10.147.35.168"}

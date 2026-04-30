@@ -1,0 +1,60 @@
+[
+  {
+    "id": 101,
+    "error_code": "ERR-260430-AB12CD",
+    "error": {
+      "message": "Failed to fetch Discord guilds",
+      "stack": "SystemError: Failed to fetch Discord guilds\n    at DiscordMemberGuildService.fetchUserGuilds (...)",
+      "name": "SystemError",
+      "code": null,
+      "errorType": "system"
+    },
+    "request": {
+      "method": "GET",
+      "url": "/gmokGuilds",
+      "originalUrl": "/api/auth/gmokGuilds",
+      "headers": {
+        "user-agent": "Mozilla/5.0",
+        "content-type": "application/json",
+        "accept": "application/json"
+      },
+      "query": {},
+      "params": {}
+    },
+    "user_agent": "Mozilla/5.0",
+    "ip_address": "10.11.12.13",
+    "user_id": "discord-user-1",
+    "severity": "error",
+    "status": 500,
+    "create_date": "2026-04-30T04:00:00.000Z"
+  },
+  {
+    "id": 102,
+    "error_code": "ERR-260430-EF34GH",
+    "error": {
+      "message": "Session expired. Please log in again.",
+      "stack": "BusinessError: Session expired. Please log in again.\n    at DiscordAuthService.refreshSession (...)",
+      "name": "BusinessError",
+      "code": null,
+      "errorType": "business"
+    },
+    "request": {
+      "method": "GET",
+      "url": "/me",
+      "originalUrl": "/api/auth/me",
+      "headers": {
+        "user-agent": "Mozilla/5.0",
+        "content-type": "application/json",
+        "accept": "application/json"
+      },
+      "query": {},
+      "params": {}
+    },
+    "user_agent": "Mozilla/5.0",
+    "ip_address": "10.21.22.23",
+    "user_id": "discord-user-2",
+    "severity": "warning",
+    "status": 401,
+    "create_date": "2026-04-30T04:02:00.000Z"
+  }
+]

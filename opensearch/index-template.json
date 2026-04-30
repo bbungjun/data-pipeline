@@ -1,0 +1,36 @@
+{
+  "index_patterns": ["gmok-back-logs-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0
+    },
+    "mappings": {
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "level": { "type": "keyword" },
+        "service": { "type": "keyword" },
+        "environment": { "type": "keyword" },
+        "source_log": { "type": "keyword" },
+        "instance_id": { "type": "keyword" },
+        "instance_name": { "type": "keyword" },
+        "event_type": { "type": "keyword" },
+        "message": { "type": "text" },
+        "request_id": { "type": "keyword" },
+        "user_id": { "type": "keyword" },
+        "match_id": { "type": "keyword" },
+        "route": { "type": "keyword" },
+        "method": { "type": "keyword" },
+        "status_code": { "type": "integer" },
+        "latency_ms": { "type": "float" },
+        "client_ip": { "type": "ip" },
+        "error_name": { "type": "keyword" },
+        "error_message": { "type": "text" },
+        "error_code": { "type": "keyword" },
+        "severity": { "type": "keyword" },
+        "meta": { "type": "object", "enabled": true },
+        "raw": { "type": "object", "enabled": false }
+      }
+    }
+  }
+}
