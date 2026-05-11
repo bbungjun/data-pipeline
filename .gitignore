@@ -1,9 +1,13 @@
 .state/
+archive/runtime-state/
+archive/generated-build/
 logs/
 *.log
+!log-pipeline/samples/**/*.log
 
 # Local runtime configuration can contain DB, OpenSearch, and Discord secrets.
 config/pipeline.env
+log-pipeline/config/pipeline.env
 .env
 .env.*
 !.env.example
@@ -24,3 +28,5 @@ node_modules/
 tfplan
 *.tfplan
 terraform.rc
+*.md 
+*.pdf
