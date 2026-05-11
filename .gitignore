@@ -1,6 +1,8 @@
 .state/
 archive/runtime-state/
 archive/generated-build/
+archive/_repo_check/
+archive/terraform_setting-main/
 logs/
 *.log
 !log-pipeline/samples/**/*.log
@@ -30,3 +32,7 @@ tfplan
 terraform.rc
 *.md 
 *.pdf
+.claude/
+log-pipeline/deploy/
+archive/terraform_setting-main/assets/deploy/
+*.zip
