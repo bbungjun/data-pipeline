@@ -1,8 +1,6 @@
 .state/
 archive/runtime-state/
 archive/generated-build/
-archive/_repo_check/
-archive/terraform_setting-main/
 logs/
 *.log
 !log-pipeline/samples/**/*.log
@@ -16,7 +14,6 @@ log-pipeline/config/pipeline.env
 !.env.*.example
 
 # Generated artifacts.
-build/
 __pycache__/
 *.pyc
 node_modules/
@@ -30,9 +27,4 @@ node_modules/
 tfplan
 *.tfplan
 terraform.rc
-*.md 
-*.pdf
 .claude/
-log-pipeline/deploy/
-archive/terraform_setting-main/assets/deploy/
-*.zip
