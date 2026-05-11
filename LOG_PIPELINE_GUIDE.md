@@ -1,4 +1,4 @@
-# GMOK 로그 파이프라인 가이드
+﻿# GMOK 로그 파이프라인 가이드
 
 이 프로젝트는 기존 백엔드 코드와 PM2 설정을 크게 바꾸지 않고, EC2 로그와 PostgreSQL `error_log` 테이블을 OpenSearch로 모아 운영 상태를 확인하고 Discord로 알림을 보내기 위한 배포 패키지입니다.
 

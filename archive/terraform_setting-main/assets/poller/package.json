@@ -1,0 +1,9 @@
+{
+  "name": "gmok-error-log-poller",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "pg": "^8.16.2"
+  }
+}
