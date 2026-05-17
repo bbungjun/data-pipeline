@@ -15,6 +15,7 @@
 - 정규화된 로그를 OpenSearch `gmok-back-logs-*` 인덱스에 저장합니다.
 - OpenSearch Dashboards에서 운영 상태와 장애 원인을 시각화합니다.
 - 조건에 따라 Discord 알림을 보낼 수 있도록 구성합니다.
+- 대량 로그 유입 시 OpenSearch Bulk API 요청을 문서 수와 payload 크기 기준으로 나눠 적재합니다.
 
 ## 기존 방식의 문제
 
@@ -128,6 +129,34 @@ log-pipeline/scripts/poll_error_log.mjs
 
 ```text
 gmok-back-logs-YYYY-MM-DD
+```
+
+대량 로그 유입 시에는 한 번의 `_bulk` 요청이 지나치게 커지지 않도록 chunking합니다.
+
+```text
+BULK_MAX_DOCUMENTS=3000
+BULK_MAX_BYTES=5242880
+```
+
+Lambda는 각 chunk를 OpenSearch Bulk API로 전송하고, bulk 응답의 item별 status를 요약해 부분 실패 건수와 실패 유형을 반환합니다.
+
+OpenSearch 장애나 mapping 오류처럼 적재 실패 로그를 보존해야 하는 경우에는 SQS/DLQ 모드로 전환할 수 있습니다.
+
+```text
+CloudWatch Logs -> Ingest Lambda -> SQS Standard Queue -> Worker Lambda -> OpenSearch
+                                                             반복 실패 -> DLQ
+```
+
+이 구조에서는 직접 적재의 낮은 지연 시간보다 실패 보존과 재처리 가능성을 우선합니다. FIFO Queue는 순서 보장 장점이 있지만, 로그 분석에서는 입력 순서보다 `@timestamp` 기준 조회와 처리량이 더 중요하다고 판단해 Standard Queue를 사용합니다. 중복 전달 가능성은 CloudWatch `log_event_id`와 DB `error_log.id` 기반 OpenSearch `_id`로 보완합니다.
+
+주요 운영 파라미터:
+
+```text
+LOG_INGEST_MODE=sqs
+WorkerBatchSize=500
+MaxReceiveCount=3
+VisibilityTimeoutSeconds=180
+SCHEMA_VERSION=1
 ```
 
 인덱스 템플릿은 필드 타입을 미리 정의합니다.
