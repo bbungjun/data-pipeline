@@ -40,6 +40,24 @@ flowchart LR
 - Discord webhook 알림
 - AWS 리소스 구성 및 배포 보조 스크립트
 
+## SQS / DLQ 설계 판단
+
+기본 적재 흐름은 `CloudWatch Logs -> Lambda -> OpenSearch` 직접 적재입니다. 구조가 단순하고 지연 시간이 짧아 평상시 로그 처리에는 적합합니다. 다만 OpenSearch가 일시적으로 느려지거나 429/5xx를 반환하는 경우, 또는 Bulk API에서 일부 문서만 실패하는 경우에는 실패한 로그를 보존하고 재처리하기 어렵습니다.
+
+그래서 장애 내성을 높이기 위해 `CloudWatch Logs -> Lambda -> SQS -> Worker Lambda -> OpenSearch` 흐름도 함께 구현했습니다. 이 구조에서는 로그 수집 속도와 OpenSearch 적재 속도를 분리할 수 있고, OpenSearch 장애가 잠깐 발생해도 메시지가 큐에 남아 재시도됩니다. 반복해서 실패하는 메시지는 DLQ로 격리해 정상 로그 처리를 막지 않도록 했습니다.
+
+고민한 trade-off는 다음과 같습니다.
+
+- `direct mode`: 단순하고 빠르지만 OpenSearch 장애나 bulk partial failure에 약합니다.
+- `sqs mode`: 구성이 조금 늘어나지만 재시도, backpressure 완화, 실패 로그 보존이 가능합니다.
+- `SQS Standard Queue`: FIFO보다 순서 보장은 약하지만 처리량과 운영 단순성이 좋습니다. 로그 분석은 입력 순서보다 `@timestamp` 기준 조회가 더 중요하다고 판단했습니다.
+- `at-least-once delivery`: SQS는 같은 메시지가 중복 전달될 수 있으므로 CloudWatch `log_event_id`, DB `error_log.id` 기반 OpenSearch `_id`를 사용해 중복 적재를 줄였습니다.
+- `Bulk partial failure`: Bulk API 응답의 item별 status를 확인해 전체 batch가 아니라 실패 문서만 재시도 대상으로 분리할 수 있게 했습니다.
+- `DLQ 격리`: mapping 오류처럼 계속 실패하는 문서는 `MaxReceiveCount` 이후 DLQ로 보내 정상 메시지 처리를 보호합니다.
+- `Backpressure 완화`: Worker batch size, visibility timeout, bulk chunk size를 조절해 OpenSearch가 감당 가능한 속도로 적재하도록 했습니다.
+
+대량 로그 테스트에서는 1만 건 문서 수가 유지되는 것을 확인했고, 단일 bulk payload가 약 12MB까지 커질 수 있어 문서 수와 byte 기준 chunking을 적용했습니다.
+
 ## 주요 파일
 
 ```text
