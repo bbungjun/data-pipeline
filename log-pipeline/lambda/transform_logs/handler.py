@@ -24,6 +24,11 @@ OUTPUT_INDEX_PREFIX = os.getenv("OUTPUT_INDEX_PREFIX", "gmok-back-logs")
 OPENSEARCH_BULK_URL = os.getenv("OPENSEARCH_BULK_URL")
 OPENSEARCH_USERNAME = os.getenv("OPENSEARCH_USERNAME")
 OPENSEARCH_PASSWORD = os.getenv("OPENSEARCH_PASSWORD")
+BULK_MAX_DOCUMENTS = int(os.getenv("BULK_MAX_DOCUMENTS", "3000"))
+BULK_MAX_BYTES = int(os.getenv("BULK_MAX_BYTES", str(5 * 1024 * 1024)))
+LOG_INGEST_MODE = os.getenv("LOG_INGEST_MODE", "direct")
+SQS_QUEUE_URL = os.getenv("SQS_QUEUE_URL")
+SCHEMA_VERSION = os.getenv("SCHEMA_VERSION", "1")
 PLAIN_TEXT_PATTERN = re.compile(r"^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}):\s?(?P<message>.*)$")
 ANSI_ESCAPE_PATTERN = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 REQUEST_LOG_PATTERN = re.compile(
@@ -76,6 +81,7 @@ class NormalizedLog:
     def to_document(self) -> dict[str, Any]:
         return {
             "@timestamp": self.timestamp,
+            "schema_version": SCHEMA_VERSION,
             "level": self.level,
             "service": self.service,
             "environment": self.environment,
@@ -573,12 +579,91 @@ def index_name_for(document: dict[str, Any]) -> str:
     return f"{OUTPUT_INDEX_PREFIX}-{day}"
 
 
+def document_id_for(document: dict[str, Any]) -> str | None:
+    raw = document.get("raw") if isinstance(document.get("raw"), dict) else {}
+    meta = document.get("meta") if isinstance(document.get("meta"), dict) else {}
+    source_log = str(document.get("source_log") or meta.get("source_log") or "log")
+
+    if source_log == "db_error_log" and raw.get("id") is not None:
+        return f"db-error-log-{raw['id']}"
+    if meta.get("log_event_id") is not None:
+        return f"{source_log}:{meta['log_event_id']}"
+    if document.get("request_id") is not None:
+        return f"{source_log}:request:{document['request_id']}"
+    return None
+
+
 def build_bulk_payload(documents: list[dict[str, Any]]) -> str:
     lines: list[str] = []
     for document in documents:
-        lines.append(json.dumps({"index": {"_index": index_name_for(document)}}))
+        action = {"_index": index_name_for(document)}
+        document_id = document_id_for(document)
+        if document_id:
+            action["_id"] = document_id
+        lines.append(json.dumps({"index": action}))
         lines.append(json.dumps(document, ensure_ascii=False))
     return "\n".join(lines) + "\n"
+
+
+def chunk_documents_for_bulk(
+    documents: list[dict[str, Any]],
+    max_documents: int = BULK_MAX_DOCUMENTS,
+    max_bytes: int = BULK_MAX_BYTES,
+) -> list[list[dict[str, Any]]]:
+    chunks: list[list[dict[str, Any]]] = []
+    current_chunk: list[dict[str, Any]] = []
+    current_bytes = 0
+
+    for document in documents:
+        document_bytes = len(build_bulk_payload([document]).encode("utf-8"))
+        would_exceed_count = len(current_chunk) >= max_documents
+        would_exceed_bytes = current_chunk and current_bytes + document_bytes > max_bytes
+        if would_exceed_count or would_exceed_bytes:
+            chunks.append(current_chunk)
+            current_chunk = []
+            current_bytes = 0
+
+        current_chunk.append(document)
+        current_bytes += document_bytes
+
+    if current_chunk:
+        chunks.append(current_chunk)
+    return chunks
+
+
+def summarize_bulk_response(response_payload: dict[str, Any]) -> dict[str, Any]:
+    items = response_payload.get("items", [])
+    failed = 0
+    failure_types: dict[str, int] = {}
+
+    for item in items:
+        result = next(iter(item.values()), {})
+        status = int(result.get("status", 0))
+        if status < 400:
+            continue
+        failed += 1
+        error_payload = result.get("error") or {}
+        failure_type = str(error_payload.get("type") or f"status_{status}")
+        failure_types[failure_type] = failure_types.get(failure_type, 0) + 1
+
+    return {
+        "items": len(items),
+        "succeeded": len(items) - failed,
+        "failed": failed,
+        "failure_types": failure_types,
+    }
+
+
+def failed_document_ids_from_bulk_response(response_payload: dict[str, Any], documents: list[dict[str, Any]]) -> list[str]:
+    failed_ids: list[str] = []
+    for item, document in zip(response_payload.get("items", []), documents):
+        result = next(iter(item.values()), {})
+        status = int(result.get("status", 0))
+        if status >= 400:
+            document_id = result.get("_id") or document_id_for(document)
+            if document_id:
+                failed_ids.append(str(document_id))
+    return failed_ids
 
 
 def push_to_opensearch(documents: list[dict[str, Any]]) -> dict[str, Any]:
@@ -587,7 +672,6 @@ def push_to_opensearch(documents: list[dict[str, Any]]) -> dict[str, Any]:
     if not documents:
         return {"pushed": False, "reason": "no documents"}
 
-    payload = build_bulk_payload(documents).encode("utf-8")
     headers = {
         "Content-Type": "application/x-ndjson",
     }
@@ -596,20 +680,150 @@ def push_to_opensearch(documents: list[dict[str, Any]]) -> dict[str, Any]:
         token = base64.b64encode(f"{OPENSEARCH_USERNAME}:{OPENSEARCH_PASSWORD}".encode("utf-8")).decode("utf-8")
         headers["Authorization"] = f"Basic {token}"
 
-    req = request.Request(
-        OPENSEARCH_BULK_URL,
-        data=payload,
-        headers=headers,
-        method="POST",
-    )
+    chunks = chunk_documents_for_bulk(documents)
+    summaries: list[dict[str, Any]] = []
+    failed = 0
+    failed_document_ids: list[str] = []
 
-    with request.urlopen(req, timeout=15) as response:
-        body = response.read().decode("utf-8")
-        return {
-            "pushed": True,
-            "status": response.status,
-            "body_preview": body[:500],
+    for index, chunk in enumerate(chunks, start=1):
+        payload = build_bulk_payload(chunk).encode("utf-8")
+        req = request.Request(
+            OPENSEARCH_BULK_URL,
+            data=payload,
+            headers=headers,
+            method="POST",
+        )
+
+        with request.urlopen(req, timeout=15) as response:
+            body = response.read().decode("utf-8")
+            try:
+                response_payload = json.loads(body)
+                summary = summarize_bulk_response(response_payload)
+                failed_document_ids.extend(failed_document_ids_from_bulk_response(response_payload, chunk))
+            except json.JSONDecodeError:
+                summary = {
+                    "items": len(chunk),
+                    "succeeded": len(chunk),
+                    "failed": 0,
+                    "failure_types": {},
+                    "body_preview": body[:500],
+                }
+            summary["chunk"] = index
+            summary["status"] = response.status
+            summary["document_count"] = len(chunk)
+            summary["payload_bytes"] = len(payload)
+            summaries.append(summary)
+            failed += int(summary.get("failed", 0))
+
+    return {
+        "pushed": failed == 0,
+        "document_count": len(documents),
+        "chunk_count": len(chunks),
+        "failed": failed,
+        "failed_document_ids": failed_document_ids,
+        "chunks": summaries,
+    }
+
+
+def build_sqs_entries(documents: list[dict[str, Any]]) -> list[list[dict[str, str]]]:
+    batches: list[list[dict[str, str]]] = []
+    current_batch: list[dict[str, str]] = []
+
+    for index, document in enumerate(documents):
+        document_id = document_id_for(document) or f"generated:{index}"
+        entry = {
+            "Id": str(index % 10),
+            "MessageBody": json.dumps(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "document_id": document_id,
+                    "document": document,
+                },
+                ensure_ascii=False,
+            ),
         }
+        current_batch.append(entry)
+        if len(current_batch) == 10:
+            batches.append(current_batch)
+            current_batch = []
+
+    if current_batch:
+        batches.append(current_batch)
+    return batches
+
+
+def enqueue_documents_to_sqs(documents: list[dict[str, Any]]) -> dict[str, Any]:
+    if boto3 is None:
+        raise RuntimeError("boto3 is required to send documents to SQS")
+    if not SQS_QUEUE_URL:
+        raise RuntimeError("SQS_QUEUE_URL is required when LOG_INGEST_MODE=sqs")
+
+    client = boto3.client("sqs")
+    batches = build_sqs_entries(documents)
+    failed_entries: list[dict[str, Any]] = []
+    for batch_index, batch in enumerate(batches, start=1):
+        response = client.send_message_batch(QueueUrl=SQS_QUEUE_URL, Entries=batch)
+        for failure in response.get("Failed", []):
+            failed_entries.append(
+                {
+                    "batch": batch_index,
+                    "id": failure.get("Id"),
+                    "code": failure.get("Code"),
+                    "message": failure.get("Message"),
+                }
+            )
+
+    if failed_entries:
+        raise RuntimeError(f"SQS send_message_batch failed entries: {json.dumps(failed_entries, ensure_ascii=False)}")
+
+    return {
+        "enqueued": True,
+        "document_count": len(documents),
+        "batch_count": len(batches),
+        "failed": 0,
+    }
+
+
+def handle_documents(documents: list[dict[str, Any]]) -> dict[str, Any]:
+    if LOG_INGEST_MODE == "sqs":
+        return enqueue_documents_to_sqs(documents)
+    return push_to_opensearch(documents)
+
+
+def _document_from_sqs_record(record: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    payload = json.loads(record.get("body") or "{}")
+    document = payload.get("document") or {}
+    document_id = payload.get("document_id") or document_id_for(document)
+    return (str(document_id), document)
+
+
+def handle_sqs_event(event: dict[str, Any], push=push_to_opensearch) -> dict[str, Any]:
+    message_documents: list[tuple[str, str, dict[str, Any]]] = []
+    for record in event.get("Records", []):
+        message_id = record.get("messageId")
+        if not message_id:
+            continue
+        document_id, document = _document_from_sqs_record(record)
+        message_documents.append((message_id, document_id, document))
+
+    documents = [document for _, _, document in message_documents]
+    push_result = push(documents)
+    failed_document_ids = set(push_result.get("failed_document_ids") or [])
+    batch_item_failures = [
+        {"itemIdentifier": message_id}
+        for message_id, document_id, _ in message_documents
+        if document_id in failed_document_ids
+    ]
+
+    if push_result.get("failed") and not failed_document_ids:
+        batch_item_failures = [{"itemIdentifier": message_id} for message_id, _, _ in message_documents]
+
+    return {
+        "processed_messages": len(message_documents),
+        "document_count": len(documents),
+        "push_result": push_result,
+        "batchItemFailures": batch_item_failures,
+    }
 
 
 def load_s3_text(bucket: str, key: str) -> str:
@@ -642,7 +856,10 @@ def _normalize_cloudwatch_logs(event: dict[str, Any]) -> list[dict[str, Any]]:
             continue
 
         parsed = parse_logs(message, source_log)
-        for document in parsed:
+        for parsed_index, document in enumerate(parsed):
+            log_event_id = log_event.get("id")
+            if log_event_id is not None and len(parsed) > 1:
+                log_event_id = f"{log_event_id}:{parsed_index}"
             document["source_log"] = document.get("source_log") or source_log
             document["instance_id"] = document.get("instance_id") or instance_id
             document["instance_name"] = document.get("instance_name") or instance_name
@@ -650,16 +867,19 @@ def _normalize_cloudwatch_logs(event: dict[str, Any]) -> list[dict[str, Any]]:
                 **(document.get("meta") or {}),
                 "log_group": log_group,
                 "log_stream": log_stream,
-                "log_event_id": log_event.get("id"),
+                "log_event_id": log_event_id,
             }
             documents.append(document)
     return documents
 
 
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+    if any(record.get("eventSource") == "aws:sqs" for record in event.get("Records", [])):
+        return handle_sqs_event(event)
+
     if "awslogs" in event:
         documents = _normalize_cloudwatch_logs(event)
-        push_result = push_to_opensearch(documents)
+        push_result = handle_documents(documents)
         return {
             "processed_files": 1,
             "document_count": len(documents),
@@ -679,7 +899,7 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
         text = load_s3_text(bucket, key)
         documents = parse_logs(text, key)
-        push_result = push_to_opensearch(documents)
+        push_result = handle_documents(documents)
         processed.append(
             {
                 "bucket": bucket,
