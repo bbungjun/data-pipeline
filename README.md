@@ -16,6 +16,7 @@
 - OpenSearch Dashboards에서 운영 상태와 장애 원인을 시각화합니다.
 - 조건에 따라 Discord 알림을 보낼 수 있도록 구성합니다.
 - 대량 로그 유입 시 OpenSearch Bulk API 요청을 문서 수와 payload 크기 기준으로 나눠 적재합니다.
+- OpenSearch 적재 실패가 발생해도 SQS/DLQ를 통해 실패 로그를 보존하고 재처리할 수 있도록 구성합니다.
 
 ## 기존 방식의 문제
 
@@ -43,7 +44,11 @@ flowchart LR
     A["EC2 Application Logs<br/>out.log / error.log"] --> B["CloudWatch Agent"]
     B --> C["CloudWatch Logs"]
     C --> D["Transform Logs Lambda"]
-    D --> E["OpenSearch<br/>gmok-back-logs-*"]
+    D -->|direct mode| E["OpenSearch<br/>gmok-back-logs-*"]
+    D -->|sqs mode| K["SQS Standard Queue"]
+    K --> L["Worker Lambda"]
+    L --> E
+    K -.-> M["DLQ<br/>반복 실패 격리"]
     E --> F["OpenSearch Dashboards"]
 
     G["PostgreSQL<br/>error_log table"] --> H["DB Error Poller"]
@@ -138,26 +143,7 @@ BULK_MAX_DOCUMENTS=3000
 BULK_MAX_BYTES=5242880
 ```
 
-Lambda는 각 chunk를 OpenSearch Bulk API로 전송하고, bulk 응답의 item별 status를 요약해 부분 실패 건수와 실패 유형을 반환합니다.
-
-OpenSearch 장애나 mapping 오류처럼 적재 실패 로그를 보존해야 하는 경우에는 SQS/DLQ 모드로 전환할 수 있습니다.
-
-```text
-CloudWatch Logs -> Ingest Lambda -> SQS Standard Queue -> Worker Lambda -> OpenSearch
-                                                             반복 실패 -> DLQ
-```
-
-이 구조에서는 직접 적재의 낮은 지연 시간보다 실패 보존과 재처리 가능성을 우선합니다. FIFO Queue는 순서 보장 장점이 있지만, 로그 분석에서는 입력 순서보다 `@timestamp` 기준 조회와 처리량이 더 중요하다고 판단해 Standard Queue를 사용합니다. 중복 전달 가능성은 CloudWatch `log_event_id`와 DB `error_log.id` 기반 OpenSearch `_id`로 보완합니다.
-
-주요 운영 파라미터:
-
-```text
-LOG_INGEST_MODE=sqs
-WorkerBatchSize=500
-MaxReceiveCount=3
-VisibilityTimeoutSeconds=180
-SCHEMA_VERSION=1
-```
+Lambda는 각 chunk를 OpenSearch Bulk API로 전송하고, bulk 응답의 item별 status를 요약해 부분 실패 건수와 실패 유형을 반환합니다. OpenSearch 장애나 mapping 오류처럼 적재 실패 로그를 보존해야 하는 경우에는 SQS/DLQ 모드로 전환할 수 있습니다.
 
 인덱스 템플릿은 필드 타입을 미리 정의합니다.
 
@@ -190,7 +176,54 @@ meta
 raw
 ```
 
-### 5. OpenSearch Dashboards
+### 5. SQS/DLQ 기반 재처리 구조
+
+기본 구조는 `CloudWatch Logs -> Lambda -> OpenSearch` 직접 적재입니다. 이 방식은 단순하고 지연 시간이 짧지만, OpenSearch가 429/5xx를 반환하거나 Bulk API에서 일부 문서만 실패하는 경우 실패 로그를 보존하고 다시 처리하기 어렵습니다.
+
+이를 보완하기 위해 SQS/DLQ 모드를 추가했습니다.
+
+```text
+CloudWatch Logs -> Ingest Lambda -> SQS Standard Queue -> Worker Lambda -> OpenSearch
+                                                             반복 실패 -> DLQ
+```
+
+이 구조에서는 로그 수집 속도와 OpenSearch 적재 속도를 분리합니다. Ingest Lambda는 정규화된 문서를 SQS에 넣고, Worker Lambda가 batch 단위로 읽어 OpenSearch Bulk API에 적재합니다. OpenSearch 장애가 잠깐 발생하면 메시지는 큐에 남아 재시도되고, 반복 실패한 메시지는 DLQ로 이동해 정상 로그 처리 흐름을 막지 않습니다.
+
+설계할 때 고려한 trade-off는 다음과 같습니다.
+
+- `SQS Standard Queue`: FIFO보다 순서 보장은 약하지만 처리량과 운영 단순성이 유리합니다. 로그 분석은 입력 순서보다 `@timestamp` 기준 조회가 중요하다고 판단했습니다.
+- `at-least-once delivery`: SQS는 같은 메시지가 중복 전달될 수 있으므로 CloudWatch `log_event_id`, DB `error_log.id` 기반 OpenSearch `_id`를 사용해 중복 적재를 방지합니다.
+- `Bulk partial failure`: Bulk API 응답의 item별 status를 확인해 전체 batch가 아니라 실패 문서만 재시도 대상으로 분리합니다.
+- `Poison message 격리`: mapping 오류처럼 계속 실패하는 문서는 `MaxReceiveCount` 이후 DLQ로 보내 정상 메시지 처리를 보호합니다.
+- `Backpressure 완화`: Worker batch size, visibility timeout, bulk chunk size를 조절해 OpenSearch가 감당 가능한 속도로 적재합니다.
+
+대량 로그 테스트에서는 1만 건 문서 수가 유지되는 것을 확인했고, 단일 bulk payload가 약 12.06MB까지 커질 수 있어 chunking을 적용했습니다. 현재 설정에서는 bulk payload 최대 크기를 약 3.62MB 수준으로 낮춰 OpenSearch 요청 실패 가능성을 줄였습니다.
+
+주요 운영 파라미터:
+
+```text
+LOG_INGEST_MODE=sqs
+SQS_QUEUE_URL=<created queue url>
+BULK_MAX_DOCUMENTS=3000
+BULK_MAX_BYTES=5242880
+WorkerBatchSize=500
+MaxReceiveCount=3
+VisibilityTimeoutSeconds=180
+SCHEMA_VERSION=1
+```
+
+관련 파일:
+
+```text
+log-pipeline/lambda/transform_logs/handler.py
+log-pipeline/deploy/aws/setup_aws_resources.ps1
+log-pipeline/config/pipeline.env.example
+tests/test_transform_logs_large_batch.py
+```
+
+배포 시에는 `setup_aws_resources.ps1`에 `-EnableSqsBuffer`를 전달하면 SQS Queue, DLQ, redrive policy, Worker Lambda event source mapping을 함께 구성할 수 있습니다.
+
+### 6. OpenSearch Dashboards
 
 OpenSearch에 저장된 로그를 시각화합니다.
 
@@ -226,7 +259,7 @@ HTTP 상태 코드 분포와 route별 실패 흐름을 확인합니다.
 
 구조화된 에러 요약과 원문 로그를 함께 확인합니다. 집계 화면에서 문제 범위를 좁힌 뒤, Discover에서 원문 stack trace까지 추적할 수 있습니다.
 
-### 6. Alert Evaluator
+### 7. Alert Evaluator
 
 OpenSearch 문서를 조회해 운영 알림 조건을 평가합니다.
 
@@ -254,25 +287,25 @@ log-pipeline/scripts/evaluate_alerts.py
 
 요청량, route별 지연시간, HTTP status code 분포를 한 화면에서 확인할 수 있습니다. 파일 로그를 직접 열어보는 대신, 운영자가 시간대별 요청 흐름과 실패 비율을 빠르게 파악할 수 있습니다.
 
-![OpenSearch Dashboard traffic and status](<./image (1).png>)
+![OpenSearch Dashboard traffic and status](<./image/image (1).png>)
 
 ### OpenSearch Dashboard: 구조화 에러와 DB error_log 추세
 
 정규화된 에러 메시지, route, status code, severity, 발생 횟수를 집계합니다. DB `error_log` 테이블에서 수집한 이벤트도 시간대별 추세로 볼 수 있어 파일 로그와 DB 기반 에러를 함께 분석할 수 있습니다.
 
-![OpenSearch Dashboard structured errors](<./image (2).png>)
+![OpenSearch Dashboard structured errors](<./image/image (2).png>)
 
 ### OpenSearch Dashboard: 원문 로그와 Lambda 실패 추적
 
 정규화된 집계 화면에서 끝나지 않고, 원문 `error.log` 메시지와 Lambda 실패 로그까지 이어서 확인할 수 있습니다. Lambda function, error name, message, request id를 기준으로 장애 실행을 추적할 수 있습니다.
 
-![OpenSearch Dashboard raw errors and lambda failures](<./image (3).png>)
+![OpenSearch Dashboard raw errors and lambda failures](<./image/image (3).png>)
 
 ### Discord 알림
 
 `evaluate_alerts.py`가 OpenSearch 문서를 조회해 반복 에러를 감지하면 Discord webhook으로 알림을 보냅니다. 알림에는 route, status, 발생 횟수, error name, dashboard Discover 링크가 포함되어 운영자가 바로 원인 분석 화면으로 이동할 수 있습니다.
 
-![Discord repeated error alert](<./image (4).png>)
+![Discord repeated error alert](<./image/image (4).png>)
 
 ## 디렉터리 구조
 
@@ -372,6 +405,11 @@ OPENSEARCH_USERNAME
 OPENSEARCH_PASSWORD
 DISCORD_WEBHOOK_URL
 DASHBOARD_URL
+LOG_INGEST_MODE
+SQS_QUEUE_URL
+BULK_MAX_DOCUMENTS
+BULK_MAX_BYTES
+SCHEMA_VERSION
 ```
 
 실제 운영 값이 들어 있는 `pipeline.env`, `.env`, `terraform.tfvars`, `terraform.tfstate` 파일은 커밋하지 않습니다.
